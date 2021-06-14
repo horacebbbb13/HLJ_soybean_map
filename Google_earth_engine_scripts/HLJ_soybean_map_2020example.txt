@@ -1,0 +1,289 @@
+//Basic settings// 
+// Load a collection of Landsat TOA reflectance images.
+var landsatCollection = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR');
+    
+// Set the region of interest to a certain region.
+var sampleRegions = table;
+
+//Compute Vegetation index//
+// Function to add an NDVI band, the dependent variable.
+var addNDVI = function(image) {
+  return image
+    .addBands(image.normalizedDifference(['B5', 'B4'])
+    .rename('NDVI'))
+    .float();
+};
+
+// Function to add an GCVI band, the dependent variable.
+var addGCVI = function(image) {
+  var nir = image.select("B5");
+  var green= image.select("B3");
+  var GCVI = image.expression(
+   "B5 / B3 - 1",
+   {
+     "B5": nir,
+     "B3": green,
+   }
+   ).rename('GCVI').float();
+  return image.addBands(GCVI)
+};
+
+// Function to add an LSWI band, the dependent variable.
+var addLSWI = function(image) {
+  return image
+    .addBands(image.normalizedDifference(['B6', 'B5'])
+    .rename('LSWI'))
+    .float();
+};
+
+// Function to add an EVI band, the dependent variable.
+var addEVI = function(image) {
+  var nir = image.select("B5");
+  var red = image.select("B4");
+  var blue= image.select("B2");
+  var EVI = image.expression(
+   "2.5*(B5 - B4)/(B5 + 6*B4-7.5*B2+1)",
+   {
+     "B5": nir,
+     "B4": red,
+     "B2": blue
+   }
+   ).rename('evi_sm').float();
+  return image.addBands(EVI)
+};
+
+// Make a cloud-free composite//
+var getQABits = function(image, start, end, newName) {
+    // Compute the bits we need to extract.
+    var pattern = 0;
+    for (var i = start; i <= end; i++) {
+       pattern += Math.pow(2, i);
+    }
+    // Return a single band image of the extracted QA bits, giving the band
+    // a new name.
+    return image.select([0], [newName])
+                  .bitwiseAnd(pattern)
+                  .rightShift(start);
+};
+
+var maskClouds = function(image) {
+  var pixelQA = image.select('pixel_qa');
+  var cloud = getQABits(pixelQA, 5, 5, 'cloud');
+  var shadow = getQABits(pixelQA, 3, 3, 'cloud_shadow');
+  return image.updateMask(cloud.eq(0)).updateMask(shadow.eq(0))
+}
+
+//Linear Harmonic model//
+// The dependent variable we are modeling.
+var dependent = 'evi_sm';
+
+// The number of cycles per year to model.
+var harmonics = 2;
+
+// Make a list of harmonic frequencies to model.
+// These also serve as band name suffixes.
+var harmonicFrequencies = ee.List.sequence(1, harmonics);
+
+// Function to get a sequence of band names for harmonic terms.
+var constructBandNames = function(base, list) {
+  return ee.List(list).map(function(i) {
+    return ee.String(base).cat(ee.Number(i).int());
+  });
+};
+
+// Construct lists of names for the harmonic terms.
+var cosNames = constructBandNames('cos_', harmonicFrequencies);
+var sinNames = constructBandNames('sin_', harmonicFrequencies);
+
+// Independent variables.
+var independents = ee.List(['constant'])
+  .cat(cosNames).cat(sinNames);
+
+// Function to add a time band.
+var addDependents = function(image) {
+  var years = image.date().difference('2020-01-01', 'day');
+  var timeRadians = ee.Image(years.multiply(2 * Math.PI)).divide(365).rename('t');
+  var constant = ee.Image(1);
+  return image.addBands(constant).addBands(timeRadians.float());
+};
+
+// Function to compute the specified number of harmonics and add them as bands.
+var addHarmonics = function(freqs) {
+  return function(image) {
+    // Make an image of frequencies.
+    var frequencies = ee.Image.constant(freqs);
+    // This band should represent time in radians.
+    var time = ee.Image(image).select('t');
+    // Get the cosine terms.
+    var cosines = time.multiply(frequencies).cos().rename(cosNames);
+    // Get the sin terms.
+    var sines = time.multiply(frequencies).sin().rename(sinNames);
+    return image.addBands(cosines).addBands(sines);
+  };
+};
+
+// Filter to the area of interest, mask clouds, add variables.
+var harmonicLandsat = landsatCollection
+  .filterBounds(sampleRegions)
+  .filterDate('2020-01-01','2020-12-31')
+  .map(maskClouds)
+  .map(addEVI)
+  .map(addNDVI)
+  .map(addLSWI)
+  .map(addGCVI)
+  .map(addDependents)
+  .map(addHarmonics(harmonicFrequencies));
+
+// The output of the regression reduction is a 4x1 array image.
+var harmonicTrend = harmonicLandsat
+  .select(independents.add(dependent))
+  .reduce(ee.Reducer.linearRegression(independents.length(), 1));
+
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents]);
+// Compute phase and amplitude.
+var phase = harmonicTrendCoefficients.select('cos_1').atan2(
+            harmonicTrendCoefficients.select('sin_1')).rename('phase');
+
+var amplitude = harmonicTrendCoefficients.select('cos_1').hypot(
+                harmonicTrendCoefficients.select('sin_1')).rename('amplitude');
+
+var phase2 = harmonicTrendCoefficients.select('cos_2').atan2(
+            harmonicTrendCoefficients.select('sin_2')).rename('phase2');
+
+var amplitude2 = harmonicTrendCoefficients.select('cos_2').hypot(
+                harmonicTrendCoefficients.select('sin_2')).rename('amplitude2');
+
+//Double Logistic Model//  Author: lixuecaosysu@gmail.com 
+var timeSeriesFitting = require('users/lixuecaosysu/publicTools:timeSeriesFitting');
+
+var yearStart = 2020;
+var yearEnd = 2021; 
+var gppCol = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+               .filter(ee.Filter.calendarRange(yearStart, yearEnd, 'year'))
+               .filterBounds(sampleRegions)
+               .map(maskClouds)
+               .map(addEVI)
+               .map(function(image){
+                 var timeField = ee.Date(image.get('system:time_start')); 
+                 var yearVal = ee.Number(ee.Date(image.get('system:time_start')).get('year'));
+                 var doyVal = ee.Number(ee.Date(image.get('system:time_start')).getRelative('day', 'year').add(1));
+                 //  *** add a doy & a consistent layer
+                 var doy = ee.Image.constant(doyVal).rename('doy').float(); 
+                 var constant = ee.Image.constant(1).float().rename('constant');
+                 image = image.float(); 
+                 return image.addBands([doy, constant])
+                              .set({'year': yearVal, 'doy': doyVal, 'system:time_start': timeField}); 
+               });
+
+var fitPara= timeSeriesFitting.doubleLogistic_GetPara(gppCol).clip(sampleRegions);
+var gppCol = timeSeriesFitting.doubleLogistic_Fitting(fitPara, gppCol); 
+
+//compute statistical features of the vegetation index
+var evi_bands=gppCol.select('fitted');
+var stdband=evi_bands.reduce(ee.Reducer.stdDev()).toFloat();
+var maxband=evi_bands.reduce(ee.Reducer.max()).toFloat();
+var minband=evi_bands.reduce(ee.Reducer.min()).toFloat();
+var diffband=maxband.subtract(minband).rename('diff');
+var percentband=evi_bands.reduce(ee.Reducer.percentile([15,50,90])).toFloat();
+
+var lswi_bands=harmonicLandsat.select('LSWI');
+var lswi_stdband=lswi_bands.reduce(ee.Reducer.stdDev()).toFloat();
+var lswi_maxband=lswi_bands.reduce(ee.Reducer.max()).toFloat();
+var lswi_minband=lswi_bands.reduce(ee.Reducer.min()).toFloat();
+var lswi_diffband=lswi_maxband.subtract(lswi_minband).rename('LSWI_diff');
+var lswi_percentband=lswi_bands.reduce(ee.Reducer.percentile([15,50,90])).toFloat();
+
+var gcvi_bands=harmonicLandsat.select('GCVI');
+var gcvi_stdband=gcvi_bands.reduce(ee.Reducer.stdDev()).toFloat();
+var gcvi_maxband=gcvi_bands.reduce(ee.Reducer.max()).toFloat();
+var gcvi_minband=gcvi_bands.reduce(ee.Reducer.min()).toFloat();
+var gcvi_diffband=gcvi_maxband.subtract(gcvi_minband).rename('GCVI_diff');
+var gcvi_percentband=gcvi_bands.reduce(ee.Reducer.percentile([15,50,90])).toFloat();
+
+//composite all features//
+var input= fitPara.addBands(stdband).addBands(maxband).addBands(minband).addBands(diffband).addBands(percentband).addBands(phase).addBands(amplitude).addBands(phase2).addBands(amplitude2).addBands(lswi_stdband).addBands(lswi_maxband).addBands(lswi_minband).addBands(lswi_diffband).addBands(lswi_percentband).addBands(gcvi_stdband).addBands(gcvi_maxband).addBands(gcvi_minband).addBands(gcvi_diffband).addBands(gcvi_percentband);
+
+//mask the image into only cropland//
+var clud2015=ee.Image.load('users/zhaojiyao15/CLUD/2015_mosaic');
+var cropland=clud2015.clip(table).eq(10);
+var input1=input.updateMask(cropland);
+
+//Collect samples//
+var wheat = table4//geometry;
+var wheat_1=wheat.limit(50);
+var rice= table5//geometry2;
+var rice_1=rice.limit(50);
+var maize= table6//geometry3;
+var maize_1=maize.limit(50);
+var sample_0=maize_1.merge(wheat_1).merge(rice_1).map(function(feature){
+  return feature.set({'name':0});
+});
+var soybean=table2;
+var sample = soybean.merge(sample_0)
+
+//RF classification//
+var training = input1.sampleRegions({
+  collection: sample,
+  properties: ['name'],
+  scale: 30,
+  tileScale:16
+});
+
+var withRandom = training.randomColumn('random');
+var split = 0.7;  // Roughly 70% training, 30% testing.
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split));
+//print(testingPartition)
+
+var bands=['vmin','vmax','n1','m1','n2','m2','fitted_stdDev','diff','fitted_p15','fitted_p50','fitted_p90','phase','amplitude','phase2','amplitude2','LSWI_stdDev','LSWI_max','LSWI_min','LSWI_diff','LSWI_p15','LSWI_p50','LSWI_p90','GCVI_max','GCVI_min','GCVI_diff','GCVI_p15','GCVI_p50','GCVI_p90'];
+var trainedClassifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainingPartition,
+  classProperty: 'name',
+  inputProperties: bands
+});
+print('randomForest, explained', trainedClassifier.explain());
+var classified = input1.classify(trainedClassifier);
+
+//Accuracy Assessment//
+var trainAccuracy = trainedClassifier.confusionMatrix();
+print('Training confusion matrix: ', trainAccuracy);
+print('Training overall accuracy: ', trainAccuracy.accuracy());
+print('Training kappa: ', trainAccuracy.kappa());
+print('Training producersAccuracy: ', trainAccuracy.producersAccuracy());
+print('Training consumersAccuracy: ', trainAccuracy.consumersAccuracy());
+var test = testingPartition.classify(trainedClassifier);
+
+var confusionMatrix = test.errorMatrix('name', 'classification');
+print('Testing error Matrix:', confusionMatrix);
+print('Testing overall accuracy: ', confusionMatrix.accuracy());
+print('Testing kappa: ', confusionMatrix.kappa());
+print('Testing producersAccuracy: ', confusionMatrix.producersAccuracy());
+print('Testing consumersAccuracy: ', confusionMatrix.consumersAccuracy());
+
+//Extract soybean planting area// 
+var soybean_ag = classified.select(['classification']).eq(1);
+
+//Calcuate soybean acreage//
+var area_ag = soybean_ag.multiply(ee.Image.pixelArea());
+var stats_ag= area_ag.reduceRegions({
+collection:table3,
+reducer:ee.Reducer.sum(),
+//geometry:table,
+scale:30,
+//bestEffort:true,
+//maxPixels:1e16,
+tileScale:16
+});
+print(stats_ag)
+Export.table.toDrive(stats_ag.select(['NAME_2','sum'],null,false));
+
+//Export map to Google Asset//
+Export.image.toAsset({
+  image:soybean_ag,
+  description: 'SoybeanAreaOFHLJ2020_0116',
+  maxPixels:1e13,
+  region: table,
+});
